@@ -1,155 +1,70 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
+import ts from 'typescript';
 
-/**
- * Tests for hover menu race condition fix.
- * 
- * The bug: When user moves mouse rapidly between different positions of the same
- * paragraph, the 180ms timer doesn't reset, causing the menu to trigger at the
- * wrong position.
- * 
- * The fix: Add position tracking to detect significant position changes (>5px)
- * and reset the timer when position changes significantly.
- */
+// Hover timing of the paragraph menu: the dwell belongs to the paragraph under
+// the pointer, not to the pointer position.
+const source = await readFile(new URL('../src/hoverIntent.ts', import.meta.url), 'utf8');
+const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } });
+const { createHoverIntent, HOVER_COLD_DELAY, HOVER_WARM_DELAY, HOVER_CLOSE_DELAY } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputText).toString('base64')}`);
 
-// Mock the schedule function behavior
-function createScheduleSimulator() {
-  let hoverTimer = null;
-  let pending = null;
-  let hoverTicket = 0;
-  const triggered = [];
-
-  const clearHoverTimer = () => {
-    hoverTicket++;
-    if (hoverTimer) clearTimeout(hoverTimer);
-    hoverTimer = null;
-    pending = null;
-  };
-
-  const schedule = (key, mode, activate, position) => {
-    // Check if same key and mode
-    if (pending?.key === key && pending.mode === mode) {
-      const lastPos = pending.position;
-      // If position hasn't changed significantly (< 5px), just update activate
-      if (lastPos && position &&
-          Math.abs(lastPos.x - position.x) < 5 &&
-          Math.abs(lastPos.y - position.y) < 5) {
-        pending.activate = activate;
-        return;
-      }
-      // Position changed significantly, reset timer
-      clearHoverTimer();
-    } else {
-      clearHoverTimer();
-    }
-
-    pending = { key, mode, activate, position };
-    const ticket = hoverTicket;
-    hoverTimer = setTimeout(() => {
-      const target = pending;
-      pending = null;
-      hoverTimer = null;
-      if (ticket === hoverTicket) {
-        target?.activate(ticket);
-        triggered.push({ key: target?.key, position: target?.position });
-      }
-    }, 120); // Using 120ms as per plan 004
-  };
-
-  return {
-    schedule,
-    triggered,
-    getPending: () => pending,
-    cleanup: () => clearHoverTimer(),
-  };
-}
-
-test('schedule triggers menu at the correct position after delay', async () => {
-  const sim = createScheduleSimulator();
-
-  // Schedule at position A
-  sim.schedule('para-1', 'hover', () => {}, { x: 100, y: 200 });
-
-  // Wait for trigger
-  await new Promise(resolve => setTimeout(resolve, 150));
-
-  assert.equal(sim.triggered.length, 1);
-  assert.deepEqual(sim.triggered[0].position, { x: 100, y: 200 });
-  sim.cleanup();
+test('moving inside one paragraph does not restart the dwell', async () => {
+  const intent = createHoverIntent({ cold: 40, warm: 10 });
+  const shown = [];
+  const started = Date.now();
+  for (let x = 0; x < 3; x++) {
+    intent.request('p1', () => shown.push({ x, after: Date.now() - started }));
+    await sleep(10);
+  }
+  await sleep(40);
+  assert.equal(shown.length, 1);
+  assert.ok(shown[0].after < 75, `shown after ${shown[0].after}ms while still moving`);
+  assert.equal(shown[0].x, 2, 'the latest pointer sample is the one activated');
 });
 
-test('rapid position changes reset the timer', async () => {
-  const sim = createScheduleSimulator();
-
-  // Schedule at position A
-  sim.schedule('para-1', 'hover', () => {}, { x: 100, y: 200 });
-
-  // Wait 60ms (half of delay)
-  await new Promise(resolve => setTimeout(resolve, 60));
-
-  // Move to position B (significant change > 5px)
-  sim.schedule('para-1', 'hover', () => {}, { x: 150, y: 250 });
-
-  // Wait another 60ms (total 120ms from first, but only 60ms from second)
-  await new Promise(resolve => setTimeout(resolve, 60));
-
-  // Should not have triggered yet (timer was reset)
-  assert.equal(sim.triggered.length, 0);
-
-  // Wait for the full delay from the second position
-  await new Promise(resolve => setTimeout(resolve, 70));
-
-  // Should have triggered at position B
-  assert.equal(sim.triggered.length, 1);
-  assert.deepEqual(sim.triggered[0].position, { x: 150, y: 250 });
-  sim.cleanup();
+test('a new paragraph replaces the waiting one', async () => {
+  const intent = createHoverIntent({ cold: 30, warm: 10 });
+  const shown = [];
+  intent.request('p1', () => shown.push('p1'));
+  await sleep(10);
+  intent.request('p2', () => shown.push('p2'));
+  assert.equal(intent.pendingKey(), 'p2');
+  await sleep(50);
+  assert.deepEqual(shown, ['p2']);
 });
 
-test('small position jitter does not reset timer', async () => {
-  const sim = createScheduleSimulator();
-
-  // Schedule at position A
-  sim.schedule('para-1', 'hover', () => {}, { x: 100, y: 200 });
-
-  // Wait 60ms
-  await new Promise(resolve => setTimeout(resolve, 60));
-
-  // Small jitter (< 5px) - should update activate but not reset timer
-  let activateCalled = false;
-  sim.schedule('para-1', 'hover', () => { activateCalled = true; }, { x: 102, y: 203 });
-
-  // Wait another 70ms (total 130ms from first, timer should NOT have reset)
-  await new Promise(resolve => setTimeout(resolve, 70));
-
-  // Should have triggered (timer was not reset by small jitter)
-  assert.equal(sim.triggered.length, 1);
-  // Position should still be the original (A), not the jittered position (B)
-  assert.deepEqual(sim.triggered[0].position, { x: 100, y: 200 });
-  sim.cleanup();
+test('switching while something is shown uses the shorter delay', async () => {
+  const intent = createHoverIntent({ cold: 80, warm: 10 });
+  const shown = [];
+  intent.request('p2', () => shown.push('p2'), { warm: true });
+  await sleep(40);
+  assert.deepEqual(shown, ['p2']);
 });
 
-test('different keys reset the timer', async () => {
-  const sim = createScheduleSimulator();
+test('immediate requests fire synchronously and cancel drops the rest', async () => {
+  const intent = createHoverIntent({ cold: 20, warm: 10 });
+  const shown = [];
+  intent.request('p1', () => shown.push('p1'), { immediate: true });
+  assert.deepEqual(shown, ['p1']);
+  intent.request('p2', () => shown.push('p2'));
+  intent.cancel();
+  await sleep(40);
+  assert.deepEqual(shown, ['p1']);
+});
 
-  // Schedule para-1
-  sim.schedule('para-1', 'hover', () => {}, { x: 100, y: 200 });
+test('activation can tell that it was superseded', async () => {
+  const intent = createHoverIntent({ cold: 5, warm: 5 });
+  let check;
+  intent.request('figure', current => { check = current; });
+  await sleep(20);
+  assert.equal(check(), true);
+  intent.request('p1', () => {});
+  assert.equal(check(), false);
+});
 
-  // Wait 60ms
-  await new Promise(resolve => setTimeout(resolve, 60));
-
-  // Schedule para-2 (different key)
-  sim.schedule('para-2', 'hover', () => {}, { x: 100, y: 300 });
-
-  // Wait 70ms
-  await new Promise(resolve => setTimeout(resolve, 70));
-
-  // para-1 should not have triggered
-  assert.equal(sim.triggered.length, 0);
-
-  // Wait for para-2 to trigger
-  await new Promise(resolve => setTimeout(resolve, 60));
-
-  assert.equal(sim.triggered.length, 1);
-  assert.equal(sim.triggered[0].key, 'para-2');
-  sim.cleanup();
+test('delays stay in the range that feels immediate', () => {
+  assert.ok(HOVER_COLD_DELAY <= 90 && HOVER_WARM_DELAY <= HOVER_COLD_DELAY);
+  assert.ok(HOVER_CLOSE_DELAY >= 200 && HOVER_CLOSE_DELAY <= 400);
 });

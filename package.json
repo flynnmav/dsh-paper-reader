@@ -1,6 +1,6 @@
 {
   "name": "dsh-paper-reader",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Read PDFs beside a DSH conversation, quote selected passages, and generate discussion-based reading notes",
   "author": "Jingyi HUANG <2270737347@qq.com>",
   "license": "MIT",
@@ -65,6 +65,7 @@
     "test:parity": "node tests/textlayer-parity-e2e.mjs",
     "test:formula": "node tests/formula-selection-e2e.mjs",
     "test:features": "node tests/reader-features-e2e.mjs",
+    "test:hover": "node tests/hover-timing-e2e.mjs",
     "test:scenarios": "node tests/host-scenarios.mjs",
     "test:stress": "node tests/host-stress.mjs"
   },

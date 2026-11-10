@@ -22,6 +22,8 @@ export interface PdfTextFragment {
   fontSize: number;
   /** Present for fragments collected from a text layer, optional in pure geometry tests. */
   element?: HTMLElement;
+  /** Position in the text layer (PDF content-stream order). */
+  order?: number;
 }
 
 export interface PdfVisualLine {
@@ -134,6 +136,7 @@ export function buildPdfVisualLines(fragments: PdfTextFragment[]): PdfVisualLine
 const baselineOf = (line: PdfVisualLine) => bottom(line.rect);
 
 function readingOrder(a: PdfTextFragment, b: PdfTextFragment): number {
+  if (a.order !== undefined && b.order !== undefined && a.order !== b.order) return a.order - b.order;
   // The text layer follows the PDF content stream, which is the order the
   // author wrote the formula in (numerator before denominator, base before
   // script). Pure geometry tests have no elements: fall back to x order.
@@ -151,45 +154,70 @@ function readingOrder(a: PdfTextFragment, b: PdfTextFragment): number {
  * hover only covered part of it. A satellite overlaps its host vertically and
  * lies within or right next to it horizontally; prose lines never overlap
  * vertically, and table cells share a baseline, so neither is affected.
+ *
+ * Every satellite joins exactly one host (the line it overlaps most), so a
+ * tall radical or a subscript between two prose lines never fuses those lines.
  */
 export function attachPdfScripts(input: PdfVisualLine[]): PdfVisualLine[] {
   const lines = input.slice();
   const host = lines.map((_, index) => index);
   const find = (index: number): number => host[index] === index ? index : (host[index] = find(host[index]));
-  const weight = (line: PdfVisualLine) => line.fontSize * 1000 + line.text.length;
-  for (let a = 0; a < lines.length; a++) {
-    for (let b = a + 1; b < lines.length; b++) {
-      const first = lines[a], second = lines[b];
-      const size = Math.max(first.fontSize, second.fontSize);
-      if (Math.abs(baselineOf(first) - baselineOf(second)) < size * 0.2) continue;
-      if (verticalOverlap(first.rect, second.rect) < Math.min(first.rect.height, second.rect.height) * 0.15) continue;
-      const [small, large] = weight(first) <= weight(second) ? [first, second] : [second, first];
-      const reach = large.fontSize * 1.2;
-      if (small.rect.left < large.rect.left - reach || right(small.rect) > right(large.rect) + reach) continue;
-      const ra = find(a), rb = find(b);
-      if (ra !== rb) host[ra] = rb;
+  // Visual mass: a one-glyph radical in a large font is still a satellite.
+  const weight = (line: PdfVisualLine) => Math.max(1, line.rect.width) * line.fontSize;
+  const heavier = (a: number, b: number) => weight(lines[a]) > weight(lines[b]) || (weight(lines[a]) === weight(lines[b]) && a < b);
+  const horizontalGap = (a: PdfParagraphRect, b: PdfParagraphRect) => Math.max(0, a.left - right(b), b.left - right(a));
+  for (let s = 0; s < lines.length; s++) {
+    const small = lines[s];
+    let best = -1, bestOverlap = 0;
+    for (let l = 0; l < lines.length; l++) {
+      if (l === s || !heavier(l, s)) continue;
+      const large = lines[l];
+      const size = Math.max(small.fontSize, large.fontSize);
+      if (Math.abs(baselineOf(small) - baselineOf(large)) < size * 0.2) continue;
+      const overlap = verticalOverlap(small.rect, large.rect);
+      const minimumHeight = Math.min(small.rect.height, large.rect.height);
+      if (overlap < minimumHeight * 0.15) continue;
+      // Two long lines of similar width are consecutive prose lines whose boxes
+      // touch (a tall glyph enlarges one of them), not a formula and its part.
+      if (small.rect.width > size * 12 && small.rect.width > large.rect.width * 0.6 && overlap < minimumHeight * 0.5) continue;
+      const reach = size * 1.2;
+      const inside = small.rect.left >= large.rect.left - reach && right(small.rect) <= right(large.rect) + reach;
+      // An exponent after the last glyph of a line piece sticks out of it
+      // (and a short base such as "e" is lighter than its long exponent).
+      const script = Math.min(small.fontSize, large.fontSize) <= size * 0.8 && horizontalGap(small.rect, large.rect) <= size * 0.6;
+      if (!inside && !script) continue;
+      if (overlap > bestOverlap) { best = l; bestOverlap = overlap; }
     }
+    if (best >= 0) host[find(s)] = find(best);
   }
   // A formula's own pieces on its main baseline can be split apart by a gap
   // (an unstretched one-glyph span such as "√" renders narrower than in the
-  // PDF). Rejoin same-baseline neighbours of a formula within two glyph widths;
-  // an equation number far to the right stays separate.
-  const sizes = () => { const count = new Map<number, number>(); lines.forEach((_, index) => count.set(find(index), (count.get(find(index)) || 0) + 1)); return count; };
+  // PDF, or an exponent sits between them). Rejoin same-baseline neighbours of
+  // a formula within two glyph widths; an equation number far to the right
+  // stays separate.
   for (let changed = true; changed;) {
     changed = false;
-    const count = sizes();
-    for (let a = 0; a < lines.length; a++) {
+    const members = new Map<number, number[]>();
+    lines.forEach((_, index) => { const root = find(index); const list = members.get(root); if (list) list.push(index); else members.set(root, [index]); });
+    for (const [root, indexes] of members) {
+      if (indexes.length < 2) continue;
+      const extent = unionRects(indexes.map(index => lines[index].rect));
       for (let b = 0; b < lines.length; b++) {
-        if (a === b || find(a) === find(b) || (count.get(find(a)) || 0) < 2) continue;
-        const formula = lines[a], piece = lines[b];
-        const size = Math.max(formula.fontSize, piece.fontSize);
-        if (Math.abs(baselineOf(formula) - baselineOf(piece)) >= size * 0.2) continue;
-        if (verticalOverlap(formula.rect, piece.rect) < Math.min(formula.rect.height, piece.rect.height) * 0.5) continue;
-        const gap = Math.max(piece.rect.left - right(formula.rect), formula.rect.left - right(piece.rect));
-        if (gap > size * 2) continue;
-        host[find(b)] = find(a);
+        if (find(b) === root) continue;
+        const piece = lines[b];
+        const joins = indexes.some(a => {
+          const formula = lines[a];
+          const size = Math.max(formula.fontSize, piece.fontSize);
+          return Math.abs(baselineOf(formula) - baselineOf(piece)) < size * 0.2 &&
+            verticalOverlap(formula.rect, piece.rect) >= Math.min(formula.rect.height, piece.rect.height) * 0.5 &&
+            horizontalGap(extent, piece.rect) <= size * 2;
+        });
+        if (!joins) continue;
+        host[find(b)] = root;
         changed = true;
+        break;
       }
+      if (changed) break;
     }
   }
   const clusters = new Map<number, PdfVisualLine[]>();
@@ -271,6 +299,188 @@ export function groupPdfVisualLines(input: PdfVisualLine[]): PdfVisualLine[][] {
   return paragraphs;
 }
 
+const EQUATION_NUMBER = /^\(\s*[A-Z]?\.?\d+(\.\d+)*[a-z]?\s*\)$/;
+const MATH_SIGN = /[=≈≠≡≤≥<>±×÷∑∏∫∂∇√∞∈∉⊂⊆∪∩∀∃→←↔⇒⇔⊗⊕∝∼]/;
+const DELIMITER = /^[\s\[\](){}|‖⟨⟩〈〉]{1,3}$/;
+const LIST_MARKER = /^\s*(?:[•·▪■◦*\-–—]|\(?[0-9a-zA-Z]{1,2}[.)]\s)/;
+const CONTINUATION = /^\s*(?:[a-zα-ω]|(?:[Ww]here|[Hh]ere|[Ww]ith|[Ii]n which|[Ss]uch that|[Ss]ubject to)\b|其中|式中|这里|此处)/;
+
+interface FormulaBlock {
+  lines: PdfVisualLine[];
+  rect: PdfParagraphRect;
+  fontSize: number;
+  /** The block is only a formula so far (no prose above it). */
+  pure: boolean;
+  /** Left edge of the block's prose. */
+  proseLeft?: number;
+  /** Set while the block's last part is a display formula. */
+  tail?: PdfParagraphRect;
+}
+
+/**
+ * A display equation is typeset between the sentence that introduces it and,
+ * often, a continuation ("where …"). The paragraph rules see three blocks
+ * (the equation is centred and set apart), so a hover covered either the prose
+ * or the equation, never the statement as a whole. This joins
+ *   - an equation number with its equation,
+ *   - a display equation with the paragraph right above it,
+ *   - a following paragraph that continues the sentence (lower-case start or
+ *     "where/with/…"), and a paragraph right below an equation that has no
+ *     paragraph above it.
+ * An equation is recognised by layout plus content: a few lines, inset from
+ * the left edge of the paragraph above, alone on its rows, and containing a
+ * relation/operator sign, attached scripts or an equation number.
+ */
+export function mergeDisplayFormulas(groups: PdfVisualLine[][]): PdfVisualLine[][] {
+  interface Item { lines: PdfVisualLine[]; rect: PdfParagraphRect; own: PdfParagraphRect; fontSize: number; text: string; numbered: boolean; used: boolean }
+  const items: Item[] = groups.filter(lines => lines.length).map(lines => {
+    const rect = unionRects(lines.map(line => line.rect));
+    return { lines: lines.slice(), rect, own: rect, fontSize: lines.reduce((sum, line) => sum + line.fontSize, 0) / lines.length, text: lines.map(line => line.text).join(' '), numbered: false, used: false };
+  }).sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+  const mathy = (item: Item) => item.numbered || item.lines.some(line => line.math) || MATH_SIGN.test(item.text);
+
+  const mathyLine = (line: PdfVisualLine) => !!line.math || MATH_SIGN.test(line.text);
+  const absorb = (host: Item, piece: Item) => {
+    host.lines.push(...piece.lines);
+    host.rect = unionRects([host.rect, piece.rect]);
+    piece.used = true;
+  };
+  // 1a. Equation numbers join the equation on their rows (also when the
+  // equation line already belongs to a paragraph).
+  const isNumber = (item: Item) => item.lines.length === 1 && EQUATION_NUMBER.test(item.text.trim());
+  for (const number of items) {
+    if (!isNumber(number)) continue;
+    let best: Item | undefined, bestGap = Infinity;
+    for (const item of items) {
+      if (item === number || item.used || isNumber(item)) continue;
+      for (const line of item.lines) {
+        if (!mathyLine(line) || verticalOverlap(line.rect, number.rect) < number.rect.height * 0.5) continue;
+        const gap = Math.max(number.rect.left - right(line.rect), line.rect.left - right(number.rect));
+        if (gap >= 0 && gap < bestGap) { best = item; bestGap = gap; }
+      }
+    }
+    if (!best) continue;
+    absorb(best, number);
+    best.numbered = true;
+  }
+  // 1b. Stray tall delimiters ("[", "]", "‖") drawn beside a formula row.
+  for (const piece of items) {
+    if (piece.used || piece.lines.length !== 1 || !DELIMITER.test(piece.text)) continue;
+    const host = items.find(item => item !== piece && !item.used && item.lines.some(line => mathyLine(line) &&
+      piece.rect.top + piece.rect.height / 2 >= line.rect.top - line.fontSize && piece.rect.top + piece.rect.height / 2 <= bottom(line.rect) + line.fontSize * 0.5 &&
+      piece.rect.left >= line.rect.left - line.fontSize * 2 && right(piece.rect) <= right(line.rect) + line.fontSize * 2));
+    if (host) absorb(host, piece);
+  }
+  // 1c. Pieces on the rows of a numbered equation, between it and its number
+  // (conditions such as "l = 1 … L" in an aligned column).
+  for (const host of items) {
+    if (host.used || !host.numbered || host.lines.length > 16) continue;
+    for (const piece of items) {
+      if (piece === host || piece.used || piece.lines.length > 2) continue;
+      if (piece.rect.left < host.rect.left || right(piece.rect) > right(host.rect)) continue;
+      if (!host.lines.some(line => verticalOverlap(line.rect, piece.rect) >= piece.rect.height * 0.5)) continue;
+      const before = host.rect;
+      absorb(host, piece);
+      host.rect = before;
+    }
+  }
+  const rest = items.filter(item => !item.used);
+
+  // Rows, not pieces: a numbered equation with side conditions has several pieces per row.
+  const rows = (item: Item) => item.lines.reduce((seen: PdfParagraphRect[], line) => {
+    if (!seen.some(rect => verticalOverlap(rect, line.rect) >= Math.min(rect.height, line.rect.height) * 0.5)) seen.push(line.rect);
+    return seen;
+  }, []).length;
+  const numbered = (item: Item) => item.numbered || item.lines.some(line => mathyLine(line) && /\(\d{1,3}(?:\.\d+)?[a-z]?\)\s*$/.test(line.text));
+  const isFormula = (item: Item) => rows(item) <= 8 && mathy(item) && !LIST_MARKER.test(item.lines[0].text);
+  const blocks: FormulaBlock[] = [];
+  const above = (item: Item): FormulaBlock | undefined => {
+    let best: FormulaBlock | undefined, bestGap = Infinity;
+    for (const block of blocks) {
+      if (horizontalOverlap(block.rect, item.rect) <= 0) continue;
+      const gap = item.rect.top - bottom(block.rect);
+      if (gap < -Math.min(block.fontSize, item.fontSize) * 0.3 || gap >= bestGap) continue;
+      best = block; bestGap = gap;
+    }
+    return best;
+  };
+  const aloneOnRows = (item: Item, lane: PdfParagraphRect) => rest.every(other => other === item ||
+    verticalOverlap(other.rect, item.rect) <= Math.min(other.rect.height, item.rect.height) * 0.3 ||
+    horizontalOverlap(other.rect, lane) <= 0);
+  const add = (block: FormulaBlock, item: Item, formula: boolean) => {
+    if (formula) item.lines.forEach(line => { line.math = true; });
+    block.lines.push(...item.lines);
+    block.rect = unionRects([block.rect, item.rect]);
+    block.tail = formula ? item.own : undefined;
+    if (!formula) { block.pure = false; block.proseLeft = Math.min(block.proseLeft ?? Infinity, item.rect.left); }
+  };
+
+  for (const item of rest) {
+    const block = above(item);
+    const formula = isFormula(item);
+    if (block) {
+      const font = Math.min(block.fontSize, item.fontSize);
+      const near = item.rect.top - bottom(block.rect) <= Math.max(block.fontSize, item.fontSize) * 3.5;
+      const inset = block.proseLeft !== undefined && item.own.left - block.proseLeft >= font * 1.8;
+      if (formula && near && aloneOnRows(item, block.rect)) {
+        // Below prose: inset and inside its column. Below a lone equation: its next row.
+        const reach = block.pure ? font * 4 : font;
+        // (the paragraph above may end in a short line, so only a lone equation bounds the right side)
+        const within = item.rect.left >= block.rect.left - reach && (!block.pure || right(item.rect) <= right(block.rect) + reach);
+        if (within && (block.pure ? rows(item) <= 3 && (item.numbered || item.lines.some(line => line.math) || item.rect.width < block.rect.width * 1.5) : inset || (numbered(item) && rows(item) <= 2))) { add(block, item, true); continue; }
+      }
+      if (block.tail && near && !inset && item.rect.left <= block.tail.left &&
+          (CONTINUATION.test(item.lines[0].text) || (block.pure && item.lines.length > 1))) {
+        add(block, item, false);
+        continue;
+      }
+    }
+    // A formula with no paragraph above it (top of a column): the paragraph below may join it.
+    const lone = formula && (item.numbered || item.lines.every(line => line.math)) && rows(item) <= 3;
+    // A paragraph may already end with its equation (tight line spacing).
+    const last = item.lines.reduce((low, line) => bottom(line.rect) > bottom(low.rect) && !EQUATION_NUMBER.test(line.text.trim()) ? line : low, item.lines[0]);
+    const endsWithFormula = !lone && item.lines.length > 1 && mathyLine(last) && last.rect.left - item.rect.left >= item.fontSize * 1.8;
+    blocks.push({ lines: item.lines, rect: item.rect, fontSize: item.fontSize, pure: lone, tail: lone ? item.own : endsWithFormula ? last.rect : undefined, proseLeft: lone ? undefined : item.rect.left });
+  }
+  return blocks.map(block => block.lines.slice().sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left));
+
+}
+
+/**
+ * Many papers separate paragraphs only by a first-line indent (no extra
+ * spacing), and a section heading sits right above its first paragraph. Split
+ * a chain at an indented line between two flush lines, and after a leading
+ * line in a clearly larger font.
+ */
+export function splitIndentedParagraphs(groups: PdfVisualLine[][]): PdfVisualLine[][] {
+  const out: PdfVisualLine[][] = [];
+  for (const lines of groups) {
+    if (lines.length < 3) { out.push(lines); continue; }
+    const lefts = lines.map(line => line.rect.left).sort((a, b) => a - b);
+    const flush = lefts[Math.floor((lefts.length - 1) / 2)];
+    const width = Math.max(...lines.map(line => right(line.rect))) - flush;
+    let current: PdfVisualLine[] = [lines[0]];
+    for (let index = 1; index < lines.length; index++) {
+      const line = lines[index], previous = lines[index - 1], next = lines[index + 1];
+      const size = line.fontSize;
+      const indent = line.rect.left - flush;
+      const isFlush = (other: PdfVisualLine) => Math.abs(other.rect.left - flush) < size * 0.5;
+      const indented = indent >= size * 0.8 && indent <= size * 2.6 && isFlush(previous) &&
+        (next ? isFlush(next) : line.rect.width > width * 0.5) && right(line.rect) >= flush + width - size * 2;
+      const afterHeading = index === 1 && previous.fontSize >= line.fontSize * 1.08 && previous.rect.width < width * 0.9;
+      if (indented || afterHeading) { out.push(current); current = []; }
+      current.push(line);
+    }
+    out.push(current);
+  }
+  return out;
+}
+
+/** Fragments of one page → hover paragraphs (lines grouped, formulas attached). */
+export function recognisePdfParagraphs(fragments: PdfTextFragment[]): PdfVisualLine[][] {
+  return mergeDisplayFormulas(splitIndentedParagraphs(groupPdfVisualLines(attachPdfScripts(buildPdfVisualLines(fragments)))));
+}
+
 interface PdfParagraphCache {
   paragraphs: PdfParagraph[];
   elements: HTMLElement[];
@@ -297,6 +507,7 @@ function collectFragments(layer: HTMLElement): PdfTextFragment[] {
     if (!bounds.width || !bounds.height) continue;
     fragments.push({
       element,
+      order: fragments.length,
       text,
       rect: { left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height },
       fontSize: readFontSize(element, layer),
@@ -306,7 +517,7 @@ function collectFragments(layer: HTMLElement): PdfTextFragment[] {
 }
 
 function buildParagraphs(layer: HTMLElement, pageNumber: number): PdfParagraph[] {
-  const groups = groupPdfVisualLines(attachPdfScripts(buildPdfVisualLines(collectFragments(layer))));
+  const groups = recognisePdfParagraphs(collectFragments(layer));
   return groups.map((lines, index) => ({
     key: `pdf-${pageNumber}-paragraph-${index + 1}`,
     elements: lines.flatMap(line => line.fragments.flatMap(fragment => fragment.element ? [fragment.element] : [])),
@@ -320,9 +531,8 @@ function clientRect(rect: { left: number; top: number; width: number; height: nu
   return { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
 }
 
-/** Find the cached paragraph containing a text-layer element. */
-export function findPdfParagraph(target: Element, layer: HTMLElement, pageNumber: number): PdfParagraph | null {
-  if (!layer.contains(target)) return null;
+/** The page's paragraphs, with client rectangles kept current while scrolling. */
+function pageParagraphs(layer: HTMLElement, pageNumber: number): PdfParagraph[] {
   let cache = paragraphCache.get(layer);
   // PdfPage replaces all spans on zoom but retains the layer element itself.
   // Checking only the WeakMap key would therefore return detached elements and
@@ -357,5 +567,36 @@ export function findPdfParagraph(target: Element, layer: HTMLElement, pageNumber
       }
     }
   }
-  return cache.paragraphs.find(paragraph => paragraph.elements.some(element => element === target || element.contains(target))) || null;
+  return cache.paragraphs;
+}
+
+/** Find the cached paragraph containing a text-layer element. */
+export function findPdfParagraph(target: Element, layer: HTMLElement, pageNumber: number): PdfParagraph | null {
+  if (!layer.contains(target)) return null;
+  return pageParagraphs(layer, pageNumber).find(paragraph => paragraph.elements.some(element => element === target || element.contains(target))) || null;
+}
+
+/**
+ * Pick a paragraph by position. A line under the point wins; otherwise the
+ * smallest paragraph whose outline contains it, so the gaps between words and
+ * lines (and the white space beside a display formula) still count as inside.
+ */
+export function pickParagraphAt<T extends { rects: ArrayLike<PdfParagraphRect> }>(paragraphs: readonly T[], x: number, y: number, slack = 2): T | null {
+  const inside = (rect: PdfParagraphRect, pad: number) => x >= rect.left - pad && x <= rect.left + rect.width + pad && y >= rect.top - pad && y <= rect.top + rect.height + pad;
+  let best: T | null = null, bestArea = Infinity;
+  for (const paragraph of paragraphs) {
+    const rects = Array.from(paragraph.rects);
+    if (!rects.length) continue;
+    const outline = unionRects(rects);
+    if (!inside(outline, slack + 2)) continue;
+    const onLine = rects.some(rect => inside(rect, slack));
+    const area = onLine ? 0 : Math.max(1, outline.width * outline.height);
+    if (area < bestArea) { best = paragraph; bestArea = area; }
+  }
+  return best;
+}
+
+/** Find the paragraph at a client position of a page's text layer. */
+export function findPdfParagraphAt(layer: HTMLElement, pageNumber: number, x: number, y: number): PdfParagraph | null {
+  return pickParagraphAt(pageParagraphs(layer, pageNumber), x, y);
 }

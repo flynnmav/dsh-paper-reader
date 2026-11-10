@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
-import { findPdfParagraph, type PdfParagraphRect } from './paragraphs';
+import { findPdfParagraphAt, type PdfParagraphRect } from './paragraphs';
+import { createHoverIntent, HOVER_CLOSE_DELAY, SCROLL_SETTLE_DELAY } from './hoverIntent';
 import { collectPdfFigures, findPdfFigureAtPoint, invalidatePdfFigureCache, type PdfFigure } from './figures';
 import { positionMarginOverlay, positionReaderOverlay, isPointInOverlayBridge, type OverlayRect } from './overlayGeometry';
 import { ReaderIcon } from './icons';
@@ -1143,16 +1144,14 @@ function PdfReaderInstance({ instance, contentKey, data, fileName, sessionId, wo
   useEffect(() => {
     const root = rootRef.current;
     if (!root || !pdf || !enableTextLayer) return;
-    let hoverTimer: ReturnType<typeof setTimeout> | undefined;
     let closeTimer: ReturnType<typeof setTimeout> | undefined;
-    let hoverTicket = 0;
     let frame: number | undefined;
     type PointerSample = Pick<PointerEvent, 'target' | 'clientX' | 'clientY' | 'pointerType'>;
     let lastEvent: PointerSample | undefined;
     let scrollIdleTimer: ReturnType<typeof setTimeout> | undefined;
     let scrolling = false;
-    let pending: { key: string; mode: 'hover' | 'figure'; activate: (ticket: number) => void; position?: { x: number; y: number } } | undefined;
-    const clearHoverTimer = () => { hoverTicket++; if (hoverTimer !== undefined) clearTimeout(hoverTimer); hoverTimer = undefined; pending = undefined; };
+    const intent = createHoverIntent();
+    const clearHoverTimer = () => intent.cancel();
     const clearCloseTimer = () => { if (closeTimer !== undefined) clearTimeout(closeTimer); closeTimer = undefined; };
     const focused = () => !!menuElementRef.current?.contains(document.activeElement);
     const closeSoon = () => {
@@ -1160,40 +1159,18 @@ function PdfReaderInstance({ instance, contentKey, data, fileName, sessionId, wo
       closeTimer = setTimeout(() => {
         closeTimer = undefined;
         if (!focused()) setMenu(current => current?.mode === 'selection' ? current : null);
-      }, 800);
+      }, HOVER_CLOSE_DELAY);
     };
-    const HOVER_DELAY = 120; // Reduced from 180ms for better responsiveness
-    const POSITION_THRESHOLD = 5; // Pixels - position changes beyond this reset the timer
-
-    const schedule = (key: string, mode: 'hover' | 'figure', activate: (ticket: number) => void, position?: { x: number; y: number }) => {
+    // The dwell belongs to the paragraph, not to the pointer position: moving
+    // along a paragraph does not restart it. What is on screen stays until its
+    // replacement appears, so crossing paragraphs never blinks.
+    const schedule = (key: string, mode: 'hover' | 'figure', activate: (current: () => boolean) => void, immediate = false) => {
       const current = menuRef.current;
-      if (current?.mode === mode && current.key === key) { clearHoverTimer(); clearCloseTimer(); return; }
-
-      // If same key and mode, check if position changed significantly
-      if (pending?.key === key && pending.mode === mode) {
-        const lastPos = pending.position;
-        // If position hasn't changed significantly (< threshold), just update activate
-        if (lastPos && position &&
-            Math.abs(lastPos.x - position.x) < POSITION_THRESHOLD &&
-            Math.abs(lastPos.y - position.y) < POSITION_THRESHOLD) {
-          pending.activate = activate;
-          return;
-        }
-        // Position changed significantly, reset timer
-        clearHoverTimer();
-      } else {
-        clearHoverTimer(); clearCloseTimer();
-      }
-
-      if (current?.mode !== 'selection') setMenu(null);
-      pending = { key, mode, activate, position };
-      const ticket = hoverTicket;
-      hoverTimer = setTimeout(() => {
-        const target = pending; pending = undefined; hoverTimer = undefined;
-        if (ticket === hoverTicket) target?.activate(ticket);
-      }, HOVER_DELAY);
+      clearCloseTimer();
+      if (current?.mode === mode && current.key === key) { clearHoverTimer(); return; }
+      intent.request(`${mode}:${key}`, activate, { immediate, warm: current?.mode === 'hover' || current?.mode === 'figure' });
     };
-    const processPointer = (event: PointerSample) => {
+    const processPointer = (event: PointerSample, immediate = false) => {
       if (event.pointerType === 'touch') return;
       let target = event.target instanceof Element ? event.target : null;
       if (!target) return;
@@ -1229,19 +1206,18 @@ function PdfReaderInstance({ instance, contentKey, data, fileName, sessionId, wo
         }
         const figure = coarseFigure ? tightenFigureToImages(coarseFigure, clientImages, event.clientX, event.clientY) : null;
         if (figure) {
-          schedule(figure.key, 'figure', ticket => {
+          schedule(figure.key, 'figure', isCurrent => {
             const preciseFigure = tightenFigureToCanvas(pageElement, figure);
             const rect = preciseFigure.rect;
             if (event.clientX < rect.left - 4 || event.clientX > rect.left + rect.width + 4 ||
-                event.clientY < rect.top - 4 || event.clientY > rect.top + rect.height + 4 || ticket !== hoverTicket) return;
+                event.clientY < rect.top - 4 || event.clientY > rect.top + rect.height + 4 || !isCurrent()) return;
             showFigure(pageElement, preciseFigure);
-          }, { x: event.clientX, y: event.clientY });
+          }, immediate);
           return;
         }
       }
-      const textLayer = target.closest<HTMLElement>('.pr-text-layer');
-      if (!textLayer || !root.contains(textLayer)) { clearHoverTimer(); closeSoon(); return; }
-      const paragraph = findPdfParagraph(target, textLayer, page);
+      // Hit-test by position: the gaps between words and lines are still the paragraph.
+      const paragraph = layer && !target.closest('button, input, textarea, select') ? findPdfParagraphAt(layer, page, event.clientX, event.clientY) : null;
       if (!paragraph || !paragraph.rects.length) { clearHoverTimer(); closeSoon(); return; }
       schedule(paragraph.key, 'hover', () => {
         const left = Math.min(...paragraph.rects.map(rect => rect.left));
@@ -1254,7 +1230,7 @@ function PdfReaderInstance({ instance, contentKey, data, fileName, sessionId, wo
           anchor: { left, top, width: right - left, height: bottom - top },
           highlights: paragraph.rects.map(rect => ({ left: rect.left, top: rect.top, width: rect.width, height: rect.height })),
         });
-      }, { x: event.clientX, y: event.clientY });
+      }, immediate);
     };
     const onPointerMove = (event: PointerEvent) => {
       lastEvent = event;
@@ -1275,8 +1251,9 @@ function PdfReaderInstance({ instance, contentKey, data, fileName, sessionId, wo
         if (!lastEvent || lastEvent.pointerType === 'touch') return;
         // Scrolling moves pages under the pointer. Never reuse the old target.
         const target = document.elementFromPoint(lastEvent.clientX, lastEvent.clientY);
-        if (target && root.contains(target)) processPointer({ target, clientX: lastEvent.clientX, clientY: lastEvent.clientY, pointerType: lastEvent.pointerType });
-      }, 180);
+        // The pointer has been resting here the whole time: no second dwell.
+        if (target && root.contains(target)) processPointer({ target, clientX: lastEvent.clientX, clientY: lastEvent.clientY, pointerType: lastEvent.pointerType }, true);
+      }, SCROLL_SETTLE_DELAY);
     };
     const onLeave = () => { lastEvent = undefined; if (frame !== undefined) cancelAnimationFrame(frame); frame = undefined; clearHoverTimer(); closeSoon(); };
     const onFocusIn = () => { if (focused()) clearCloseTimer(); };
@@ -1466,7 +1443,7 @@ function PdfReaderInstance({ instance, contentKey, data, fileName, sessionId, wo
       {returnPoint && <button type="button" className="pr-return-chip" onClick={() => { const point = returnPoint; setReturnPoint(null); goToDestination(point); }}><ReaderIcon name="back" />返回第 {returnPoint.page} 页</button>}
       {linkPreview && <div ref={linkPreviewRef} className="pr-link-preview" role="tooltip" style={{ visibility: 'hidden' }}><strong>{linkPreview.title}</strong><p>{linkPreview.text}</p></div>}
       {menu?.mode === 'figure' && menu.highlights?.map((rect, index) => <div key={`${menu.key}:${index}`} className="pr-figure-highlight" style={rect} aria-hidden="true" />)}
-      {menu?.mode === 'hover' && <div className="pr-paragraph-outline pr-hover-highlight" style={{ left: menu.anchor.left - 3, top: menu.anchor.top - 2, width: menu.anchor.width + 6, height: menu.anchor.height + 4 }} aria-hidden="true" />}
+      {menu?.mode === 'hover' && <div key={menu.key} className="pr-paragraph-outline pr-hover-highlight" style={{ left: menu.anchor.left - 3, top: menu.anchor.top - 2, width: menu.anchor.width + 6, height: menu.anchor.height + 4 }} aria-hidden="true" />}
       {menu && <div ref={menuElementRef} className="pr-selection-menu" data-placement={menuPosition?.placement} data-orientation={menuPosition?.orientation ?? (menu.mode === 'hover' ? 'vertical' : 'horizontal')} role="toolbar" aria-label={menu.mode === 'figure' ? '图表操作' : menu.mode === 'hover' ? '悬停段落的操作' : '选中文字的操作'} aria-orientation={menuPosition?.orientation === 'vertical' ? 'vertical' : 'horizontal'} style={{ left: menuPosition?.left || 0, top: menuPosition?.top || 0, visibility: menuPosition ? 'visible' : 'hidden' }} onMouseDown={(event) => event.preventDefault()}>
         <button type="button" onClick={() => dispatch("explain")}>解释</button>
         {menu.mode !== 'figure' && <><button type="button" onClick={() => dispatch("translate")}>翻译</button><button type="button" onClick={() => dispatch("ask")}>提问</button></>}

@@ -112,7 +112,8 @@
 .pr-text-layer span[role="img"] { user-select: none; cursor: default; }
 .pr-text-layer ::selection { color: transparent; background: color-mix(in srgb, var(--pr-accent) 18%, transparent); }
 .pr-text-layer br::selection { background: transparent; }
-.pr-paragraph-outline { position: fixed; z-index: 900; pointer-events: none; border: 1px solid color-mix(in srgb, var(--pr-pdf-mark) 70%, transparent); border-radius: 4px; background: color-mix(in srgb, var(--pr-pdf-mark) 9%, transparent); }
+.pr-paragraph-outline { position: fixed; z-index: 900; pointer-events: none; border: 1px solid color-mix(in srgb, var(--pr-pdf-mark) 70%, transparent); border-radius: 4px; background: color-mix(in srgb, var(--pr-pdf-mark) 9%, transparent); animation: pr-outline-in 110ms ease-out; }
+@keyframes pr-outline-in { from { opacity: 0; } to { opacity: 1; } }
 .pr-figure-highlight { position: fixed; z-index: 900; pointer-events: none; border: 0; border-radius: 4px; background: transparent; box-shadow: inset 0 0 0 2px var(--pr-accent); }
 .pr-selection-menu { position: fixed; z-index: 1000; display: flex; width: max-content; flex-wrap: wrap; gap: 2px; max-width: calc(100vw - 16px); padding: 4px; border: 1px solid var(--pr-border); border-radius: 8px; color: var(--pr-ink); background: var(--pr-menu); background-color: var(--pr-menu); box-shadow: 0 8px 24px rgb(0 0 0 / 16%), 0 2px 6px rgb(0 0 0 / 12%); animation: menu-enter 150ms cubic-bezier(0.23, 1, 0.32, 1); transform-origin: top center; }
 .pr-selection-menu[data-closing] { animation: menu-exit 100ms cubic-bezier(0.23, 1, 0.32, 1) forwards; }
@@ -207,7 +208,7 @@
 @media (prefers-reduced-motion: reduce) {
   .pr-shell button, .pr-local button, .pr-open-local button, .pr-toolbar-status, .pr-notice { transition: none; }
   .pr-shell button:active, .pr-local button:active, .pr-open-local button:active, .pr-file-button:active, .pr-notice { transform: none !important; }
-  .pr-selection-menu, .pr-popover, .pr-link-preview { animation: none; }
+  .pr-selection-menu, .pr-popover, .pr-link-preview, .pr-paragraph-outline { animation: none; }
   .pr-selection-menu[data-closing] { animation: none; opacity: 0; }
   @starting-style { .pr-toolbar-status, .pr-notice { opacity: 1; transform: none; } }
 }

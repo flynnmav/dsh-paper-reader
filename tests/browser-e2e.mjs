@@ -63,8 +63,9 @@ try {
   await page.screenshot({ path: 'test-results/figure-hover.png' })
   const figureMenuBox = await page.locator('.pr-selection-menu').boundingBox()
   assert.ok(figureMenuBox)
+  // A short slip off the figure and back keeps the menu (it closes ~0.3s after leaving).
   await page.mouse.move(10, figureMenuBox.y + figureMenuBox.height + 20)
-  await page.waitForTimeout(400)
+  await page.waitForTimeout(150)
   await page.mouse.move(figureMenuBox.x + figureMenuBox.width / 2, figureMenuBox.y + figureMenuBox.height / 2)
   await page.getByRole('toolbar', { name: '图表操作' }).waitFor({ state: 'visible' })
   await page.locator('.pr-selection-menu button').first().click()

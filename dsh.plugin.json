@@ -1,7 +1,7 @@
 {
   "name": "dsh-paper-reader",
   "description": "在对话旁阅读 PDF、引用选段，并一键生成讨论式阅读笔记",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "entry": { "name": "dsh-paper-reader", "inject": [] },
   "client": { "platform": "web" }
 }
